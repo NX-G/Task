@@ -1,0 +1,175 @@
+# Drawing AI — local stack for Docker Desktop.
+#
+#   docker compose up -d --build                          # inference stack
+#   docker compose --profile airflow up -d --build        # + Airflow (set PIPELINE_EXECUTOR=airflow)
+#   docker compose --profile training run --rm trainer all --synthetic 30 --epochs 3
+#
+name: drawing-ai
+
+x-app-env: &app-env
+  POSTGRES_DSN: postgresql+psycopg2://drawing:drawing@postgres:5432/drawing_ai
+  MONGO_URI: mongodb://mongo:27017
+  MONGO_DB: drawing_ai
+  REDIS_URL: redis://redis:6379/0
+  MLFLOW_TRACKING_URI: http://mlflow:5000
+  AIRFLOW_API_URL: http://airflow-webserver:8080/api/v1
+  PIPELINE_EXECUTOR: ${PIPELINE_EXECUTOR:-inline}
+
+x-app: &app
+  build:
+    context: .
+    dockerfile: src/Deployment/Dockerfile
+    args:
+      INSTALL_ML: ${INSTALL_ML:-false}
+  image: drawing-ai/service:latest
+  env_file:
+    - path: .env
+      required: false
+  environment:
+    <<: *app-env
+  restart: unless-stopped
+  depends_on:
+    postgres: { condition: service_healthy }
+    mongo: { condition: service_healthy }
+    redis: { condition: service_healthy }
+
+x-airflow: &airflow
+  build:
+    context: .
+    dockerfile: src/Deployment/airflow/Dockerfile
+  image: drawing-ai/airflow:latest
+  profiles: ["airflow"]
+  env_file:
+    - path: .env
+      required: false
+  environment:
+    <<: *app-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://drawing:drawing@postgres:5432/airflow
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+    AIRFLOW__API__AUTH_BACKENDS: airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session
+    AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_SECRET_KEY:-change-me}
+  depends_on:
+    postgres: { condition: service_healthy }
+    mongo: { condition: service_healthy }
+
+services:
+  # ---------------------------------------------------------------- storage
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: drawing
+      POSTGRES_PASSWORD: drawing
+      POSTGRES_DB: drawing_ai
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./src/Deployment/postgres/init-databases.sh:/docker-entrypoint-initdb.d/init-databases.sh:ro
+    ports: ["5432:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U drawing -d drawing_ai"]
+      interval: 5s
+      retries: 20
+
+  mongo:
+    image: mongo:7
+    volumes: [mongodata:/data/db]
+    ports: ["27017:27017"]
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 5s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 20
+
+  # ---------------------------------------------------------- model registry
+  mlflow:
+    build: src/Deployment/mlflow
+    image: drawing-ai/mlflow:latest
+    environment:
+      MLFLOW_BACKEND_STORE_URI: postgresql://drawing:drawing@postgres:5432/mlflow
+    volumes: [mlartifacts:/mlartifacts]
+    ports: ["5001:5000"]  # host 5000 is taken by AirPlay on macOS
+    depends_on:
+      postgres: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')"]
+      interval: 10s
+      retries: 30
+    restart: unless-stopped
+
+  # ------------------------------------------------------------- inference
+  api:
+    <<: *app
+    ports: ["8000:8000"]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/healthz"]
+      interval: 10s
+      retries: 10
+
+  worker:
+    <<: *app
+    command: ["celery", "-A", "service.worker.celery_app", "worker", "-Q", "drawings", "--concurrency", "${WORKER_CONCURRENCY:-2}", "--loglevel", "INFO"]
+    volumes: [modelcache:/models]
+
+  # ----------------------------------------------------- optional: Airflow
+  airflow-init:
+    <<: *airflow
+    command:
+      - bash
+      - -c
+      - >-
+        airflow db migrate &&
+        (airflow users create --username "$${AIRFLOW_USER:-airflow}" --password "$${AIRFLOW_PASSWORD:-airflow}"
+        --firstname Drawing --lastname Admin --role Admin --email admin@example.com || true)
+    restart: "no"
+
+  airflow-webserver:
+    <<: *airflow
+    command: webserver
+    ports: ["8080:8080"]
+    depends_on:
+      airflow-init: { condition: service_completed_successfully }
+    restart: unless-stopped
+
+  airflow-scheduler:
+    <<: *airflow
+    command: scheduler
+    volumes: [modelcache:/models]
+    depends_on:
+      airflow-init: { condition: service_completed_successfully }
+    restart: unless-stopped
+
+  # ------------------------------------------------- optional: training
+  trainer:
+    build:
+      context: .
+      dockerfile: src/Training/Dockerfile
+      args:
+        TORCH_INDEX: ${TORCH_INDEX:-https://download.pytorch.org/whl/cpu}
+    image: drawing-ai/trainer:latest
+    profiles: ["training"]
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      <<: *app-env
+      YOLO_CONFIG_DIR: /data/.ultralytics
+    volumes:
+      - ./data:/data
+    shm_size: 2gb
+    depends_on:
+      mlflow: { condition: service_healthy }
+      mongo: { condition: service_healthy }
+
+volumes:
+  pgdata:
+  mongodata:
+  mlartifacts:
+  modelcache:
