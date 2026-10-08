@@ -1,0 +1,8 @@
+# Trained-model backends (YOLO, RF-DETR, GOT-OCR2.0). Installed when the image
+# is built with --build-arg INSTALL_ML=true. CPU wheels by default.
+torch>=2.3
+torchvision>=0.18
+ultralytics>=8.3,<9
+rfdetr>=1.2,<2
+transformers>=4.49,<5
+accelerate>=0.33
